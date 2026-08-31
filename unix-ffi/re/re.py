@@ -91,12 +91,18 @@ class PCREMatch:
 class PCREPattern:
     def __init__(self, compiled_ptn):
         self.obj = compiled_ptn
+        self.key = None  # set while this pattern is held by the cache
 
     def _free(self):
         # MicroPython does not run __del__ on instances of Python classes, so
         # the compiled pattern cannot be released by the garbage collector and
         # has to be freed explicitly.
         if self.obj is not None:
+            if self.key is not None:
+                # Drop the pattern from the cache first, so that nothing hands
+                # out a pointer that is about to become invalid.
+                del _cache[self.key]
+                self.key = None
             pcre2_code_free(self.obj)
             self.obj = None
 
@@ -184,7 +190,7 @@ class PCREPattern:
             start = end
 
 
-def compile(pattern, flags=0):
+def _compile(pattern, flags):
     # These are output arguments and must be writable and of the size that
     # pcre2_compile() writes: int for the error code, PCRE2_SIZE for the offset.
     errcode = array.array("i", [0])
@@ -194,48 +200,82 @@ def compile(pattern, flags=0):
     return PCREPattern(regex)
 
 
-# The functions below compile a pattern that is not visible to the caller, so
-# they must free it again.  The match objects they return do not refer to it.
+# Compiled patterns are cached, the way CPython does it, so that using the same
+# pattern again does not compile it a second time.  compile() returns the
+# cached pattern, so re.compile(p) is re.compile(p), as in CPython.
+#
+# The cache owns the patterns it holds and never evicts them.  A pattern that
+# is still being used, either by the caller or by a call further up the stack,
+# must not be freed underneath it; a replacement callback passed to sub() can
+# otherwise trigger exactly that.  The cache is bounded instead: once it is
+# full, further patterns are compiled and, where this module owns them, freed
+# again after use.
+_MAXCACHE = 32
+_cache = {}
+
+
+def _cached(pattern, flags):
+    # Return the compiled pattern, and whether the caller has to free it.
+    key = (pattern, flags)
+    r = _cache.get(key)
+    if r is not None:
+        return r, False
+    r = _compile(pattern, flags)
+    if len(_cache) < _MAXCACHE:
+        _cache[key] = r
+        r.key = key
+        return r, False
+    return r, True
+
+
+def compile(pattern, flags=0):
+    # The pattern belongs to the caller, so it is never freed here.
+    return _cached(pattern, flags)[0]
 
 
 def search(pattern, string, flags=0):
-    r = compile(pattern, flags)
+    r, owned = _cached(pattern, flags)
     try:
         return r.search(string)
     finally:
-        r._free()
+        if owned:
+            r._free()
 
 
 def match(pattern, string, flags=0):
-    r = compile(pattern, flags | PCRE2_ANCHORED)
+    r, owned = _cached(pattern, flags | PCRE2_ANCHORED)
     try:
         return r.search(string)
     finally:
-        r._free()
+        if owned:
+            r._free()
 
 
 def sub(pattern, repl, s, count=0, flags=0):
-    r = compile(pattern, flags)
+    r, owned = _cached(pattern, flags)
     try:
         return r.sub(repl, s, count)
     finally:
-        r._free()
+        if owned:
+            r._free()
 
 
 def split(pattern, s, maxsplit=0, flags=0):
-    r = compile(pattern, flags)
+    r, owned = _cached(pattern, flags)
     try:
         return r.split(s, maxsplit)
     finally:
-        r._free()
+        if owned:
+            r._free()
 
 
 def findall(pattern, s, flags=0):
-    r = compile(pattern, flags)
+    r, owned = _cached(pattern, flags)
     try:
         return r.findall(s)
     finally:
-        r._free()
+        if owned:
+            r._free()
 
 
 def escape(s):

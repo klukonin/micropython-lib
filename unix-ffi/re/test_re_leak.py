@@ -6,6 +6,10 @@
 # A pattern returned by re.compile() and kept by the caller is not covered
 # here.  MicroPython does not run __del__ on instances of Python classes, so
 # such a pattern can only be released explicitly.
+#
+# The bounded cache that the module level functions keep is covered: it must
+# not grow past its limit, and the patterns that do not fit into it must be
+# freed again.
 
 import gc
 import re
@@ -21,6 +25,7 @@ try:
     rss()
 except OSError:
     # No /proc, so memory use cannot be measured here.
+    print("SKIP")
     raise SystemExit
 
 
@@ -97,3 +102,48 @@ def many_groups():
 
 
 check_no_leak("pattern with several groups", many_groups)
+
+
+# compile() returns the cached pattern, the way CPython does, so compiling the
+# same pattern again does not allocate.
+assert re.compile("a(b)c") is re.compile("a(b)c")
+check_no_leak("re.compile() with the same pattern", lambda: re.compile("a(b)c"))
+
+# _free() drops the pattern from the cache, so that nothing afterwards hands
+# out a pointer to memory that has been released.
+r = re.compile("zz(y)")
+r._free()
+assert re.search("zz(y)", "xxzzyxx").group(0) == "zzy"
+
+
+# The module level functions cache the patterns they compile.  That cache must
+# stay bounded, and a pattern that does not fit into it has to be freed again.
+counter = [0]
+
+
+def distinct_patterns():
+    counter[0] += 1
+    re.search("a%dc" % counter[0], "xxabcxx")
+
+
+# Push far more distinct patterns through the cache than it can hold: it has
+# to stop growing.
+for _ in range(re._MAXCACHE * 4):
+    distinct_patterns()
+assert len(re._cache) <= re._MAXCACHE, len(re._cache)
+
+check_no_leak("re.search() with distinct patterns", distinct_patterns)
+assert len(re._cache) <= re._MAXCACHE, len(re._cache)
+
+
+# A replacement callback runs while sub() is still using its own pattern, and
+# may push further patterns through the cache.  The pattern that is in use must
+# survive that.
+def reentrant_repl(m):
+    counter[0] += 1
+    re.search("z%dz" % counter[0], "nothing here")
+    return "z"
+
+
+check_no_leak("re.sub() with a reentrant callback", lambda: re.sub("a", reentrant_repl, "caaab"))
+assert len(re._cache) <= re._MAXCACHE, len(re._cache)
