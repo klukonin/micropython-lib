@@ -22,6 +22,12 @@ pcre2_pattern_info = pcre2.func("i", "pcre2_pattern_info_8", "Pip")
 #       PCRE2_SIZE *pcre2_get_ovector_pointer(pcre2_match_data *match_data);
 pcre2_get_ovector_pointer = pcre2.func("p", "pcre2_get_ovector_pointer_8", "p")
 
+#       void pcre2_code_free(pcre2_code *code);
+pcre2_code_free = pcre2.func("v", "pcre2_code_free_8", "p")
+
+#       void pcre2_match_data_free(pcre2_match_data *match_data);
+pcre2_match_data_free = pcre2.func("v", "pcre2_match_data_free_8", "p")
+
 #       pcre2_match_data *pcre2_match_data_create_from_pattern(const pcre2_code *code,
 #           pcre2_general_context *gcontext);
 pcre2_match_data_create_from_pattern = pcre2.func(
@@ -86,20 +92,32 @@ class PCREPattern:
     def __init__(self, compiled_ptn):
         self.obj = compiled_ptn
 
+    def _free(self):
+        # MicroPython does not run __del__ on instances of Python classes, so
+        # the compiled pattern cannot be released by the garbage collector and
+        # has to be freed explicitly.
+        if self.obj is not None:
+            pcre2_code_free(self.obj)
+            self.obj = None
+
     def search(self, s, pos=0, endpos=-1, _flags=0):
         assert endpos == -1, "pos: %d, endpos: %d" % (pos, endpos)
         buf = array.array("i", [0])
         pcre2_pattern_info(self.obj, PCRE2_INFO_CAPTURECOUNT, buf)
         cap_count = buf[0]
         match_data = pcre2_match_data_create_from_pattern(self.obj, None)
-        num = pcre2_match(self.obj, s, len(s), pos, _flags, match_data, None)
-        if num == -1:
-            # No match
-            return None
-        ov_ptr = pcre2_get_ovector_pointer(match_data)
-        # pcre2_get_ovector_pointer return PCRE2_SIZE
-        ov_buf = uctypes.bytearray_at(ov_ptr, PCRE2_SIZE_SIZE * (cap_count + 1) * 2)
-        ov = array.array(PCRE2_SIZE_TYPE, ov_buf)
+        try:
+            num = pcre2_match(self.obj, s, len(s), pos, _flags, match_data, None)
+            if num == -1:
+                # No match
+                return None
+            ov_ptr = pcre2_get_ovector_pointer(match_data)
+            # pcre2_get_ovector_pointer return PCRE2_SIZE.  The offsets are
+            # copied out here, because the match data is freed below.
+            ov_buf = uctypes.bytearray_at(ov_ptr, PCRE2_SIZE_SIZE * (cap_count + 1) * 2)
+            ov = array.array(PCRE2_SIZE_TYPE, ov_buf)
+        finally:
+            pcre2_match_data_free(match_data)
         # We don't care how many matching subexpressions we got, we
         # care only about total # of capturing ones (including empty)
         return PCREMatch(s, cap_count + 1, ov)
@@ -174,29 +192,48 @@ def compile(pattern, flags=0):
     return PCREPattern(regex)
 
 
+# The functions below compile a pattern that is not visible to the caller, so
+# they must free it again.  The match objects they return do not refer to it.
+
+
 def search(pattern, string, flags=0):
     r = compile(pattern, flags)
-    return r.search(string)
+    try:
+        return r.search(string)
+    finally:
+        r._free()
 
 
 def match(pattern, string, flags=0):
     r = compile(pattern, flags | PCRE2_ANCHORED)
-    return r.search(string)
+    try:
+        return r.search(string)
+    finally:
+        r._free()
 
 
 def sub(pattern, repl, s, count=0, flags=0):
     r = compile(pattern, flags)
-    return r.sub(repl, s, count)
+    try:
+        return r.sub(repl, s, count)
+    finally:
+        r._free()
 
 
 def split(pattern, s, maxsplit=0, flags=0):
     r = compile(pattern, flags)
-    return r.split(s, maxsplit)
+    try:
+        return r.split(s, maxsplit)
+    finally:
+        r._free()
 
 
 def findall(pattern, s, flags=0):
     r = compile(pattern, flags)
-    return r.findall(s)
+    try:
+        return r.findall(s)
+    finally:
+        r._free()
 
 
 def escape(s):
